@@ -17,7 +17,7 @@ DEER_API_KEY=...
 ## Run
 
 ```bash
-cd split_image/
+cd Endo-image-split/
 ```
 
 Run the full pipeline:
