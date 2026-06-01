@@ -29,6 +29,8 @@ python3 main.py \
   --progress
 ```
 
+The pipeline supports parallel API requests via `--parallelism` (default: `2`).
+
 ## Modes
 
 - `classify-only`: run composite classification only. Output: `artifacts/composite_classification.jsonl`
