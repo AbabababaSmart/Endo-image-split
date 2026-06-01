@@ -1,0 +1,8 @@
+__pycache__/
+artifacts/source_manifest.jsonl
+artifacts/composite_classification.jsonl
+artifacts/decision_log.jsonl
+artifacts/splits/
+runs/
+review_composite_classification.ipynb
+review_composite_image_descriptions.ipynb
