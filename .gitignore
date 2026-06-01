@@ -6,3 +6,4 @@ artifacts/splits/
 runs/
 review_composite_classification.ipynb
 review_composite_image_descriptions.ipynb
+.env
