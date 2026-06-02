@@ -4,7 +4,7 @@ from os import path
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from io_utils import make_sample_id, read_jsonl, write_jsonl
+from multi_modal_rag.split_image.io_utils import make_sample_id, read_jsonl, write_jsonl
 
 
 def build_manifest(
