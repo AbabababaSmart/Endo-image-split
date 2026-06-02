@@ -8,11 +8,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
-from multi_modal_rag.split_image.api_client import ChatResult, OpenAICompatibleClient, encode_image_path_to_data_url
-from multi_modal_rag.split_image.env_utils import get_api_config
-from multi_modal_rag.split_image.io_utils import append_jsonl, area_xyxy, clamp_box_xyxy, read_jsonl, robust_json_loads
-from multi_modal_rag.split_image.prompts import build_stage1_messages, build_stage2_messages
-from multi_modal_rag.split_image.provenance import build_manifest
+try:
+    from .api_client import ChatResult, OpenAICompatibleClient, encode_image_path_to_data_url
+    from .env_utils import get_api_config
+    from .io_utils import append_jsonl, area_xyxy, clamp_box_xyxy, read_jsonl, robust_json_loads
+    from .prompts import build_stage1_messages, build_stage2_messages
+    from .provenance import build_manifest
+except ImportError:
+    from api_client import ChatResult, OpenAICompatibleClient, encode_image_path_to_data_url
+    from env_utils import get_api_config
+    from io_utils import append_jsonl, area_xyxy, clamp_box_xyxy, read_jsonl, robust_json_loads
+    from prompts import build_stage1_messages, build_stage2_messages
+    from provenance import build_manifest
 
 CLASSIFIED_OK = "classified_ok"
 SPLIT_DONE = "split_done"

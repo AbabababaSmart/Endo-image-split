@@ -5,8 +5,12 @@ import argparse
 import json
 from pathlib import Path
 
-from multi_modal_rag.split_image.env_utils import PROJECT_ROOT
-from multi_modal_rag.split_image.pipeline import run_pipeline
+try:
+    from .env_utils import PROJECT_ROOT
+    from .pipeline import run_pipeline
+except ImportError:
+    from env_utils import PROJECT_ROOT
+    from pipeline import run_pipeline
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
