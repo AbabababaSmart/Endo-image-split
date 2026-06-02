@@ -83,6 +83,7 @@ def _parse_stage1(response: ChatResult) -> Dict[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError("Stage1 response is not a JSON object")
     return {
+        "is_endoscopic": bool(obj.get("is_endoscopic", False)),
         "is_composite": bool(obj.get("is_composite", False)),
         "estimated_subfigure_count": max(0, int(obj.get("estimated_subfigure_count", 0) or 0)),
         "confidence": max(0.0, min(1.0, float(obj.get("confidence", 0.0) or 0.0))),
@@ -152,6 +153,12 @@ def _sanitize_norm1000_subfigures(subfigures: List[Dict[str, Any]]) -> List[Dict
     return out
 
 
+def _is_split_candidate(classification_row: Dict[str, Any]) -> bool:
+    return bool(classification_row.get("is_endoscopic", False)) and bool(
+        classification_row.get("is_composite", False)
+    )
+
+
 def _map_norm1000_box_to_source_image(
     *,
     box_norm1000_xyxy: List[int],
@@ -218,12 +225,11 @@ def _classify_one(
         "sample_id": sample_id,
         "image_path": str(image_path),
         "status": CLASSIFIED_OK,
+        "is_endoscopic": stage1["is_endoscopic"],
         "is_composite": stage1["is_composite"],
         "composite_confidence": stage1["confidence"],
         "estimated_subfigure_count": stage1["estimated_subfigure_count"],
         "reason": stage1["reason"],
-        "stage1_model": stage1_model,
-        **_build_response_meta("stage1", stage1_response),
     }
 
 
@@ -397,10 +403,15 @@ def _run_classification_stage(
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                     "traceback": traceback.format_exc(limit=8),
-                    "stage1_model": args.stage1_model or args.model,
                 }
                 if isinstance(exc, ModelResponseParseError):
-                    result.update(_build_response_meta(exc.stage, exc.response))
+                    result.update(
+                        {
+                            "stage1_output_text": exc.response.primary_text,
+                            "stage1_content": exc.response.content,
+                            "stage1_reasoning_content": exc.response.reasoning_content,
+                        }
+                    )
 
             append_jsonl(classification_path, [result])
             summary["processed_rows"] += 1
@@ -454,7 +465,7 @@ def _run_split_stage(
     classification_map = _load_row_map(classification_path)
     split_processed_ids = _load_processed_split_ids(split_decision_log_path) if args.resume else set()
     classified_ok_map = {k: v for k, v in classification_map.items() if v.get("status") == CLASSIFIED_OK}
-    composite_ids = {k for k, v in classified_ok_map.items() if bool(v.get("is_composite", False))}
+    composite_ids = {k for k, v in classified_ok_map.items() if _is_split_candidate(v)}
     todo_rows = [row for row in manifest_rows if row["sample_id"] in composite_ids and row["sample_id"] not in split_processed_ids]
     if args.limit and args.limit > 0:
         todo_rows = todo_rows[: args.limit]
@@ -597,7 +608,7 @@ def _run_full_stage(
             )
             new_classification_row = classification_row
 
-        if not bool(classification_row.get("is_composite", False)):
+        if not _is_split_candidate(classification_row):
             return new_classification_row, classification_row, []
 
         split_decision, split_rows = _split_one(
