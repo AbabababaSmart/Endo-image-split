@@ -41,7 +41,7 @@ def build_stage1_messages(target_image_data_url: str) -> List[Dict[str, Any]]:
     ]
 
 
-def build_stage2_messages(
+def build_stage2_vlm_messages(
     *,
     target_image_data_url: str,
     source_final_description: str,
@@ -102,3 +102,62 @@ def build_stage2_messages(
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
+
+
+def build_stage2_codex_prompt(
+    *,
+    sample_id: str,
+    image_path: str,
+    work_dir: str,
+    splits_dir: str,
+    projection_image_path: str,
+    result_json_path: str,
+    source_final_description: str,
+    stage1_reason: str,
+    estimated_subfigure_count: int,
+) -> str:
+    return (
+        "你是负责医学复合图拆分的 agent。请用 Python/PIL 和文件系统完成子图定位、裁剪、复核，"
+        "并把最终 JSON 写入 result_json_path。\n\n"
+        "目标：从原图中拆出所有真实内窥镜图像面板。只要面板可以独立裁剪并描述，即使它们属于观察顺序、操作过程或病例流程，也应该拆分。"
+        "跳过示意图、病理/影像学图、统计图、器械体外照片、纯文字、caption、页眉页脚等非内镜图像。有效内镜面板少于 2 个时返回 subfigures=[]。\n\n"
+        "执行规范：\n"
+        "- 先实际保存 crop 和 projection，再写 result_json_path；不要只返回计划路径。每个最终 crop 写入到 "
+        f"{splits_dir}/{sample_id}__NN.jpg，NN 从 01 连续编号；不要保存中间 crop。\n"
+        "- bbox_source_xyxy 使用原图像素坐标，crop 必须直接来自该 bbox，不缩放、不拼接、不额外加边。\n"
+        "- bbox/crop 要贴合内镜面板图像本体：不漏掉有效图像边缘，不混入可避免的 caption、说明文字、分隔空白或相邻面板。\n"
+        "- 多个面板竖向或横向紧邻时，白色间隔、分隔线、外部编号、箭头和右侧/下方说明文字都是面板外内容，不能框进去。"
+        "每个 bbox 必须只覆盖一个独立内镜面板，不能跨越两个面板之间的空白分隔带，也不能为了包含文字说明而扩大到面板外。\n"
+        "- 以真实图像矩形边界、黑色三角角区或内镜画面边缘作为裁剪边界。若中文标注/箭头是印在内镜图像内部且无法避开，可以保留；"
+        "但如果文字位于面板外白底区域、caption 区或相邻说明区，必须排除。\n"
+        "- 不能把同一个内镜面板从中间截断或只裁一部分。检查 crop 的四条边：如果边界外紧邻区域仍属于同一面板的图像内容、黑色角区或连续黏膜画面，必须外扩到完整面板边界；"
+        "不要为了避开面板内部文字或箭头而截掉真实图像内容。\n"
+        "- 用 Python/PIL 将最终 bbox 画到 projection_image_path，并重新打开 projection 和每个 crop 检查；不准就修正 bbox、覆盖 crop、重画 projection。无法确认准确的子图不要输出。\n"
+        "- description 必须用中文写，主要从 source_final_description 中提取和对应；如果原图中有与该子图直接相关的 caption、编号或标注文字，可以适当结合。"
+        "描述最好按“部位 - 概览 - 细节”的信息顺序组织，但不要机械使用固定标签或完全一致句式。证据不足的信息直接省略，切记不要瞎编；每个子图 1-2 句即可。\n\n"
+        "result_json_path 的 JSON 要求：\n"
+        "- 顶层包含 sample_id, image_path, projection_image_path, subfigures。\n"
+        "- 每个 subfigure 包含 subfigure_index, bbox_source_xyxy, split_image_path, description。\n"
+        "- split_image_path 和 projection_image_path 必须指向实际保存并复核过的最终文件；没有有效拆分时 projection_image_path 可为空字符串。\n"
+        "- 不输出 schema 之外的字段。\n\n"
+        f"sample_id: {sample_id}\n"
+        f"image_path: {image_path}\n"
+        f"work_dir: {work_dir}\n"
+        f"splits_dir: {splits_dir}\n"
+        f"projection_image_path: {projection_image_path}\n"
+        f"result_json_path: {result_json_path}\n"
+        f"stage1_reason: {stage1_reason}\n"
+        f"estimated_subfigure_count: {estimated_subfigure_count}\n"
+        f"source_final_description: {source_final_description}\n"
+    )
+
+
+def build_stage2_messages(
+    *,
+    target_image_data_url: str,
+    source_final_description: str,
+) -> List[Dict[str, Any]]:
+    return build_stage2_vlm_messages(
+        target_image_data_url=target_image_data_url,
+        source_final_description=source_final_description,
+    )

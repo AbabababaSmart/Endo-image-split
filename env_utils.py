@@ -29,18 +29,22 @@ def load_env_file(env_path: Optional[Path] = None, override: bool = False) -> Pa
     raise FileNotFoundError(f"Env file not found. Tried: {candidates}")
 
 
-def get_api_config(env_path: Optional[Path] = None) -> Tuple[str, str, Path]:
+def get_provider_config(env_path: Optional[Path] = None) -> Tuple[str, str, Path]:
     loaded_env = load_env_file(env_path=env_path, override=False)
     base_url = (
-        os.getenv("BASE_URL")
+        os.getenv("IKun_BASE_URL")
+        or os.getenv("IKUN_BASE_URL")
+        or os.getenv("BASE_URL")
         or os.getenv("OPENAI_BASE_URL")
         or os.getenv("VLLM_BASE_URL")
         or ""
     ).strip()
     api_key = (
-        os.getenv("DEER_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
+        os.getenv("IKun_API_KEY")
+        or os.getenv("IKUN_API_KEY")
         or os.getenv("API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("DEER_API_KEY")
         or ""
     ).strip()
     if not base_url:
@@ -48,3 +52,7 @@ def get_api_config(env_path: Optional[Path] = None) -> Tuple[str, str, Path]:
     if not api_key:
         raise RuntimeError("Missing API key in env file.")
     return base_url, api_key, loaded_env
+
+
+def get_api_config(env_path: Optional[Path] = None) -> Tuple[str, str, Path]:
+    return get_provider_config(env_path=env_path)

@@ -39,15 +39,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Classification output reused by split-only/full modes.",
     )
     parser.add_argument(
+        "--split-results-jsonl",
+        default=str(PROJECT_ROOT / "artifacts" / "split_results.jsonl"),
+        help="Per-source-image split decisions for either vlm or codex backends.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["full", "classify-only", "split-only"],
         default="full",
         help="Run full pipeline, only composite classification, or only splitting from prior classification results.",
     )
     parser.add_argument("--env-file", default=str(PROJECT_ROOT / ".env"))
-    parser.add_argument("--model", required=True, help="Default VLM model for both stages.")
-    parser.add_argument("--stage1-model", default="", help="Optional override model for composite triage.")
-    parser.add_argument("--stage2-model", default="", help="Optional override model for split extraction.")
+    parser.add_argument(
+        "--split-backend",
+        choices=["vlm", "codex"],
+        default="vlm",
+        help="Second-stage backend: structured VLM output or codex exec agentic workflow.",
+    )
+    parser.add_argument("--stage1-model", default="", help="Model used for first-stage composite triage.")
+    parser.add_argument(
+        "--stage2-vlm-model",
+        default="",
+        help="Model used when --split-backend=vlm.",
+    )
+    parser.add_argument(
+        "--stage2-codex-model",
+        default="",
+        help="Model used when --split-backend=codex.",
+    )
+    parser.add_argument(
+        "--codex-sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        default="danger-full-access",
+        help="Sandbox mode passed to codex exec for the second-stage codex backend.",
+    )
     parser.add_argument("--api-image-max-edge", type=int, default=1536)
     parser.add_argument("--api-image-jpeg-quality", type=int, default=90)
     parser.add_argument("--parallelism", type=int, default=2)
@@ -59,9 +84,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    mode = str(args.mode).strip().lower()
+    split_backend = str(args.split_backend).strip().lower()
+
+    if mode in {"classify-only", "full"} and not str(args.stage1_model).strip():
+        parser.error("--stage1-model is required for classify-only and full modes.")
+
+    if mode in {"split-only", "full"}:
+        if split_backend == "vlm" and not str(args.stage2_vlm_model).strip():
+            parser.error("--stage2-vlm-model is required when --split-backend=vlm.")
+        if split_backend == "codex" and not str(args.stage2_codex_model).strip():
+            parser.error("--stage2-codex-model is required when --split-backend=codex.")
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    validate_args(args, parser)
     summary = run_pipeline(args)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

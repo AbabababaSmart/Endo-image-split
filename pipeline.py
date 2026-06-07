@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import shutil
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,20 +12,29 @@ from PIL import Image
 
 try:
     from .api_client import ChatResult, OpenAICompatibleClient, encode_image_path_to_data_url
-    from .env_utils import get_api_config
+    from .codex_exec_client import run_codex_exec
+    from .env_utils import get_provider_config
     from .io_utils import append_jsonl, area_xyxy, clamp_box_xyxy, read_jsonl, robust_json_loads
-    from .prompts import build_stage1_messages, build_stage2_messages
+    from .prompts import (
+        build_stage1_messages,
+        build_stage2_codex_prompt,
+        build_stage2_vlm_messages,
+    )
     from .provenance import build_manifest
 except ImportError:
     from api_client import ChatResult, OpenAICompatibleClient, encode_image_path_to_data_url
-    from env_utils import get_api_config
+    from codex_exec_client import run_codex_exec
+    from env_utils import get_provider_config
     from io_utils import append_jsonl, area_xyxy, clamp_box_xyxy, read_jsonl, robust_json_loads
-    from prompts import build_stage1_messages, build_stage2_messages
+    from prompts import (
+        build_stage1_messages,
+        build_stage2_codex_prompt,
+        build_stage2_vlm_messages,
+    )
     from provenance import build_manifest
 
 CLASSIFIED_OK = "classified_ok"
-SPLIT_DONE = "split_done"
-SPLIT_EMPTY = "split_empty"
+SPLIT_ERROR = "error"
 
 
 class ModelResponseParseError(ValueError):
@@ -45,14 +56,13 @@ def _load_row_map(path: Path) -> Dict[str, Dict[str, Any]]:
     return rows
 
 
-def _load_processed_split_ids(split_decision_log_path: Path) -> set[str]:
+def _load_processed_split_ids(split_results_path: Path) -> set[str]:
     processed = set()
-    if not split_decision_log_path.exists():
+    if not split_results_path.exists():
         return processed
-    for row in read_jsonl(split_decision_log_path):
-        status = str(row.get("status", "")).strip()
+    for row in read_jsonl(split_results_path):
         sample_id = str(row.get("sample_id", "")).strip()
-        if sample_id and status in {SPLIT_DONE, SPLIT_EMPTY}:
+        if sample_id and "error_type" not in row:
             processed.add(sample_id)
     return processed
 
@@ -91,7 +101,7 @@ def _parse_stage1(response: ChatResult) -> Dict[str, Any]:
     }
 
 
-def _parse_stage2(response: ChatResult) -> List[Dict[str, Any]]:
+def _parse_stage2_vlm(response: ChatResult) -> List[Dict[str, Any]]:
     obj = robust_json_loads(response.primary_text)
     if not isinstance(obj, dict):
         raise ValueError("Stage2 response is not a JSON object")
@@ -99,14 +109,12 @@ def _parse_stage2(response: ChatResult) -> List[Dict[str, Any]]:
     if not isinstance(items, list):
         raise ValueError("Stage2 response missing subfigures list")
     parsed: List[Dict[str, Any]] = []
-    for idx, item in enumerate(items, start=1):
+    for item in items:
         if not isinstance(item, dict):
             continue
         bbox = item.get("bbox_norm1000_xyxy")
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            continue
         description = str(item.get("description", "") or "").strip()
-        if not description:
+        if not isinstance(bbox, list) or len(bbox) != 4 or not description:
             continue
         parsed.append(
             {
@@ -115,17 +123,6 @@ def _parse_stage2(response: ChatResult) -> List[Dict[str, Any]]:
             }
         )
     return parsed
-
-
-def _build_response_meta(prefix: str, response: ChatResult) -> Dict[str, Any]:
-    return {
-        f"{prefix}_output_text": response.primary_text,
-        f"{prefix}_output_source": response.primary_source,
-        f"{prefix}_content": response.content,
-        f"{prefix}_reasoning_content": response.reasoning_content,
-        f"{prefix}_finish_reason": response.finish_reason,
-        f"{prefix}_thinking_disabled": response.thinking_disabled,
-    }
 
 
 def _make_client(args: Any, *, base_url: str, api_key: str) -> OpenAICompatibleClient:
@@ -153,10 +150,125 @@ def _sanitize_norm1000_subfigures(subfigures: List[Dict[str, Any]]) -> List[Dict
     return out
 
 
+def _sanitize_source_subfigures(
+    subfigures: List[Dict[str, Any]],
+    *,
+    source_image_size: Tuple[int, int],
+) -> List[Dict[str, Any]]:
+    src_w, src_h = source_image_size
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in subfigures:
+        bbox = item.get("bbox_source_xyxy")
+        description = str(item.get("description", "") or "").strip()
+        if not isinstance(bbox, list) or len(bbox) != 4 or not description:
+            continue
+        box = clamp_box_xyxy([int(round(float(v))) for v in bbox], width=src_w, height=src_h)
+        if area_xyxy(box) <= 0:
+            continue
+        key = (tuple(box), description)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"bbox_source_xyxy": box, "description": description})
+    out.sort(key=lambda x: (x["bbox_source_xyxy"][1], x["bbox_source_xyxy"][0]))
+    return out
+
+
+def _resolve_codex_output_path(path_value: Any, *, work_dir: Path) -> Path:
+    path_str = str(path_value or "").strip()
+    if not path_str:
+        raise ValueError("Codex output path is empty")
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = work_dir / path
+    path = path.resolve()
+    try:
+        path.relative_to(work_dir)
+    except ValueError as exc:
+        raise ValueError(f"Codex output path is outside work_dir: {path}") from exc
+    return path
+
+
+def _prepare_codex_input_image(*, image_path: Path, sample_id: str, input_dir: Path) -> Path:
+    input_dir.mkdir(parents=True, exist_ok=True)
+    suffix = image_path.suffix.lower() or ".jpg"
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}:
+        suffix = ".jpg"
+    local_path = input_dir / f"{sample_id}{suffix}"
+    shutil.copy2(image_path, local_path)
+    return local_path.resolve()
+
+
+def _sanitize_codex_subfigures(
+    subfigures: List[Dict[str, Any]],
+    *,
+    sample_id: str,
+    source_image_size: Tuple[int, int],
+    work_dir: Path,
+    splits_dir: Path,
+) -> List[Dict[str, Any]]:
+    src_w, src_h = source_image_size
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in subfigures:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox_source_xyxy")
+        description = str(item.get("description", "") or "").strip()
+        if not isinstance(bbox, list) or len(bbox) != 4 or not description:
+            continue
+        box = clamp_box_xyxy([int(round(float(v))) for v in bbox], width=src_w, height=src_h)
+        if area_xyxy(box) <= 0:
+            continue
+
+        split_path = _resolve_codex_output_path(item.get("split_image_path"), work_dir=work_dir)
+        try:
+            split_path.relative_to(splits_dir)
+        except ValueError as exc:
+            raise ValueError(f"Codex split image path is outside splits_dir: {split_path}") from exc
+        raw_index = int(item.get("subfigure_index") or len(out) + 1)
+        expected_path = (splits_dir / f"{sample_id}__{raw_index:02d}.jpg").resolve()
+        if split_path != expected_path:
+            raise ValueError(f"Codex split image path must be {expected_path}, got {split_path}")
+        if not split_path.exists():
+            raise FileNotFoundError(f"Codex split image not found: {split_path}")
+        with Image.open(split_path) as crop_image:
+            crop_w, crop_h = crop_image.size
+            if crop_w <= 0 or crop_h <= 0:
+                raise ValueError(f"Codex split image has invalid size: {split_path}")
+
+        key = (tuple(box), str(split_path), description)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "subfigure_index": raw_index,
+                "bbox_source_xyxy": box,
+                "split_image_path": str(split_path),
+                "description": description,
+            }
+        )
+    out.sort(key=lambda x: x["subfigure_index"])
+    expected_indices = list(range(1, len(out) + 1))
+    actual_indices = [int(item["subfigure_index"]) for item in out]
+    if actual_indices != expected_indices:
+        raise ValueError(f"Codex subfigure_index values must be sequential from 1: {actual_indices}")
+    return out
+
+
 def _is_split_candidate(classification_row: Dict[str, Any]) -> bool:
     return bool(classification_row.get("is_endoscopic", False)) and bool(
         classification_row.get("is_composite", False)
     )
+
+
+def _selected_stage2_model(args: Any) -> str:
+    split_backend = str(args.split_backend).strip().lower()
+    if split_backend == "vlm":
+        return str(args.stage2_vlm_model).strip()
+    return str(args.stage2_codex_model).strip()
 
 
 def _map_norm1000_box_to_source_image(
@@ -193,6 +305,81 @@ def _save_crop(
             save_kwargs["optimize"] = True
         crop.save(out_path, **save_kwargs)
         return out_path, crop.size
+
+
+def _build_split_decision(
+    *,
+    sample_id: str,
+    image_path: Path,
+    subfigures: Optional[List[Dict[str, Any]]] = None,
+    error_type: str = "",
+    error_message: str = "",
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "sample_id": sample_id,
+        "image_path": str(image_path),
+        "subfigures": subfigures or [],
+    }
+    if error_type:
+        row["error_type"] = error_type
+    if error_message:
+        row["error_message"] = error_message
+    return row
+
+
+def _build_split_rows(
+    row: Dict[str, Any],
+    *,
+    source_subfigures: List[Dict[str, Any]],
+    artifacts_dir: Path,
+) -> List[Dict[str, Any]]:
+    sample_id = str(row["sample_id"])
+    image_path = Path(row["image_path"]).expanduser().resolve()
+    split_rows: List[Dict[str, Any]] = []
+    for idx, item in enumerate(source_subfigures, start=1):
+        split_path = artifacts_dir / "splits" / f"{sample_id}__{idx:02d}.jpg"
+        _save_crop(
+            image_path=image_path,
+            crop_box_xyxy=item["bbox_source_xyxy"],
+            out_path=split_path,
+            image_format="JPEG",
+            jpeg_quality=95,
+        )
+        split_rows.append(
+            {
+                "sample_id": sample_id,
+                "source_image_path": str(image_path),
+                "split_image_path": str(split_path),
+                "subfigure_index": idx,
+                "bbox_source_xyxy": item["bbox_source_xyxy"],
+                "description": item["description"],
+                "source_final_description": str(row.get("source_final_description", "") or "").strip(),
+            }
+        )
+    return split_rows
+
+
+def _build_codex_split_rows(
+    row: Dict[str, Any],
+    *,
+    source_subfigures: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    sample_id = str(row["sample_id"])
+    image_path = Path(row["image_path"]).expanduser().resolve()
+    split_rows: List[Dict[str, Any]] = []
+    for idx, item in enumerate(source_subfigures, start=1):
+        split_rows.append(
+            {
+                "sample_id": sample_id,
+                "source_image_path": str(image_path),
+                "split_image_path": item["split_image_path"],
+                "subfigure_index": idx,
+                "bbox_source_xyxy": item["bbox_source_xyxy"],
+                "description": item["description"],
+                "source_final_description": str(row.get("source_final_description", "") or "").strip(),
+            }
+        )
+    return split_rows
 
 
 def _classify_one(
@@ -233,13 +420,11 @@ def _classify_one(
     }
 
 
-def _split_one(
+def _split_one_vlm(
     row: Dict[str, Any],
     *,
-    classification_row: Dict[str, Any],
     client: OpenAICompatibleClient,
-    stage1_model: str,
-    stage2_model: str,
+    stage2_vlm_model: str,
     api_image_max_edge: int,
     api_image_jpeg_quality: int,
     artifacts_dir: Path,
@@ -252,8 +437,8 @@ def _split_one(
         jpeg_quality=api_image_jpeg_quality,
     )
     stage2_response = client.chat(
-        model=stage2_model,
-        messages=build_stage2_messages(
+        model=stage2_vlm_model,
+        messages=build_stage2_vlm_messages(
             target_image_data_url=target_image_url,
             source_final_description=str(row.get("source_final_description", "") or "").strip(),
         ),
@@ -262,67 +447,129 @@ def _split_one(
         response_format={"type": "json_object"},
     )
     try:
-        parsed_subfigures = _sanitize_norm1000_subfigures(_parse_stage2(stage2_response))
+        parsed_subfigures = _sanitize_norm1000_subfigures(_parse_stage2_vlm(stage2_response))
     except Exception as exc:
-        raise ModelResponseParseError(stage="stage2", response=stage2_response, cause=exc) from exc
-
-    if len(parsed_subfigures) < 2:
-        return {
-            "sample_id": sample_id,
-            "image_path": str(image_path),
-            "status": SPLIT_EMPTY,
-            "is_composite": True,
-            "estimated_subfigure_count": int(classification_row.get("estimated_subfigure_count", 0) or 0),
-            "reason": "model_returned_fewer_than_two_valid_subfigures",
-            "stage1_model": stage1_model,
-            "stage2_model": stage2_model,
-            **_build_response_meta("stage2", stage2_response),
-        }, []
+        raise ModelResponseParseError(stage="stage2_vlm", response=stage2_response, cause=exc) from exc
 
     with Image.open(image_path) as src_image:
         src_size = src_image.size
 
-    split_rows: List[Dict[str, Any]] = []
-    for idx, item in enumerate(parsed_subfigures, start=1):
-        box_norm1000 = item["bbox_norm1000_xyxy"]
-        box_source = _map_norm1000_box_to_source_image(
-            box_norm1000_xyxy=box_norm1000,
-            source_image_size=src_size,
-        )
-        split_path = artifacts_dir / "splits" / f"{sample_id}__{idx:02d}.jpg"
-        _save_crop(
+    source_subfigures = [
+        {
+            "bbox_source_xyxy": _map_norm1000_box_to_source_image(
+                box_norm1000_xyxy=item["bbox_norm1000_xyxy"],
+                source_image_size=src_size,
+            ),
+            "description": item["description"],
+        }
+        for item in parsed_subfigures
+    ]
+
+    if len(source_subfigures) < 2:
+        return _build_split_decision(
+            sample_id=sample_id,
             image_path=image_path,
-            crop_box_xyxy=box_source,
-            out_path=split_path,
-            image_format="JPEG",
-            jpeg_quality=95,
+        ), []
+
+    split_rows = _build_split_rows(row, source_subfigures=source_subfigures, artifacts_dir=artifacts_dir)
+    return _build_split_decision(
+        sample_id=sample_id,
+        image_path=image_path,
+        subfigures=source_subfigures,
+    ), split_rows
+
+
+def _split_one_codex(
+    row: Dict[str, Any],
+    *,
+    classification_row: Dict[str, Any],
+    args: Any,
+    artifacts_dir: Path,
+    work_dir: Path,
+    base_url: str,
+    api_key: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    sample_id = str(row["sample_id"])
+    image_path = Path(row["image_path"]).expanduser().resolve()
+    splits_dir = artifacts_dir / "splits"
+    projection_path = artifacts_dir / "bbox_projections" / f"{sample_id}.jpg"
+    codex_result_path = artifacts_dir / "codex_results" / f"{sample_id}.json"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    projection_path.parent.mkdir(parents=True, exist_ok=True)
+    codex_result_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"codex_input_{sample_id}_", dir="/tmp") as temp_dir:
+        codex_image_path = _prepare_codex_input_image(
+            image_path=image_path,
+            sample_id=sample_id,
+            input_dir=Path(temp_dir),
         )
-        split_rows.append(
-            {
-                "sample_id": sample_id,
-                "source_image_path": str(image_path),
-                "split_image_path": str(split_path),
-                "description": item["description"],
-                "source_final_description": str(row.get("source_final_description", "") or "").strip(),
-                "subfigure_bbox_norm1000_xyxy": box_norm1000,
-                "subfigure_bbox_source_xyxy": box_source,
-                "stage1_model": stage1_model,
-                "stage2_model": stage2_model,
-            }
+        prompt = build_stage2_codex_prompt(
+            sample_id=sample_id,
+            image_path=str(codex_image_path),
+            work_dir=str(work_dir),
+            splits_dir=str(splits_dir),
+            projection_image_path=str(projection_path),
+            result_json_path=str(codex_result_path),
+            source_final_description=str(row.get("source_final_description", "") or "").strip(),
+            stage1_reason=str(classification_row.get("reason", "") or "").strip(),
+            estimated_subfigure_count=int(classification_row.get("estimated_subfigure_count", 0) or 0),
+        )
+        result = run_codex_exec(
+            prompt=prompt,
+            image_path=codex_image_path,
+            result_json_path=codex_result_path,
+            work_dir=work_dir,
+            base_url=base_url,
+            api_key=api_key,
+            model=str(args.stage2_codex_model).strip(),
+            sandbox=str(args.codex_sandbox).strip(),
+            timeout_s=int(args.timeout_s),
         )
 
-    return {
-        "sample_id": sample_id,
-        "image_path": str(image_path),
-        "status": SPLIT_DONE,
-        "is_composite": True,
-        "estimated_subfigure_count": int(classification_row.get("estimated_subfigure_count", 0) or 0),
-        "split_count": len(split_rows),
-        "reason": str(classification_row.get("reason", "") or "").strip(),
-        "stage1_model": stage1_model,
-        "stage2_model": stage2_model,
-        **_build_response_meta("stage2", stage2_response),
-    }, split_rows
+        if str(result.get("sample_id", "") or "").strip() != sample_id:
+            raise ValueError(f"Codex returned mismatched sample_id: {result.get('sample_id')}")
+
+        with Image.open(image_path) as src_image:
+            src_size = src_image.size
+        source_subfigures = _sanitize_codex_subfigures(
+            list(result.get("subfigures", []) or []),
+            sample_id=sample_id,
+            source_image_size=src_size,
+            work_dir=work_dir,
+            splits_dir=splits_dir.resolve(),
+        )
+
+        if len(source_subfigures) < 2:
+            expected_count = int(classification_row.get("estimated_subfigure_count", 0) or 0)
+            if expected_count >= 2:
+                raise ValueError(
+                    f"Codex returned fewer than 2 saved subfigures for composite candidate "
+                    f"(estimated_subfigure_count={expected_count})."
+                )
+            return _build_split_decision(
+                sample_id=sample_id,
+                image_path=image_path,
+            ), []
+
+        projection_value = str(result.get("projection_image_path", "") or "").strip()
+        if not projection_value:
+            raise ValueError("Codex split result missing projection_image_path")
+        returned_projection_path = _resolve_codex_output_path(projection_value, work_dir=work_dir)
+        if returned_projection_path != projection_path.resolve():
+            raise ValueError(f"Codex projection image path must be {projection_path.resolve()}, got {returned_projection_path}")
+        if not returned_projection_path.exists():
+            raise FileNotFoundError(f"Codex projection image not found: {returned_projection_path}")
+        with Image.open(returned_projection_path) as projection_image:
+            proj_w, proj_h = projection_image.size
+            if proj_w <= 0 or proj_h <= 0:
+                raise ValueError(f"Codex projection image has invalid size: {returned_projection_path}")
+
+    split_rows = _build_codex_split_rows(row, source_subfigures=source_subfigures)
+    return _build_split_decision(
+        sample_id=sample_id,
+        image_path=image_path,
+        subfigures=source_subfigures,
+    ), split_rows
 
 
 def _ensure_manifest(args: Any, manifest_path: Path) -> List[Dict[str, Any]]:
@@ -367,6 +614,7 @@ def _run_classification_stage(
 
     summary = {
         "mode": "classify-only",
+        "stage1_model": str(args.stage1_model).strip(),
         "env_file": str(env_path),
         "manifest_path": str(manifest_path),
         "classification_jsonl": str(classification_path),
@@ -384,7 +632,7 @@ def _run_classification_stage(
         return _classify_one(
             row,
             client=client,
-            stage1_model=args.stage1_model or args.model,
+            stage1_model=str(args.stage1_model).strip(),
             api_image_max_edge=int(args.api_image_max_edge),
             api_image_jpeg_quality=int(args.api_image_jpeg_quality),
         )
@@ -399,19 +647,11 @@ def _run_classification_stage(
                 result = {
                     "sample_id": row["sample_id"],
                     "image_path": row["image_path"],
-                    "status": "error",
+                    "status": SPLIT_ERROR,
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                     "traceback": traceback.format_exc(limit=8),
                 }
-                if isinstance(exc, ModelResponseParseError):
-                    result.update(
-                        {
-                            "stage1_output_text": exc.response.primary_text,
-                            "stage1_content": exc.response.content,
-                            "stage1_reasoning_content": exc.response.reasoning_content,
-                        }
-                    )
 
             append_jsonl(classification_path, [result])
             summary["processed_rows"] += 1
@@ -444,14 +684,47 @@ def _run_classification_stage(
     return summary
 
 
+def _run_split_backend(
+    row: Dict[str, Any],
+    *,
+    classification_row: Dict[str, Any],
+    args: Any,
+    artifacts_dir: Path,
+    work_dir: Path,
+    base_url: str,
+    api_key: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    split_backend = str(args.split_backend).strip().lower()
+    if split_backend == "vlm":
+        client = _make_client(args, base_url=base_url, api_key=api_key)
+        return _split_one_vlm(
+            row,
+            client=client,
+            stage2_vlm_model=str(args.stage2_vlm_model).strip(),
+            api_image_max_edge=int(args.api_image_max_edge),
+            api_image_jpeg_quality=int(args.api_image_jpeg_quality),
+            artifacts_dir=artifacts_dir,
+        )
+    return _split_one_codex(
+        row,
+        classification_row=classification_row,
+        args=args,
+        artifacts_dir=artifacts_dir,
+        work_dir=work_dir,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+
 def _run_split_stage(
     *,
     args: Any,
     manifest_rows: List[Dict[str, Any]],
     classification_path: Path,
-    split_decision_log_path: Path,
+    split_results_path: Path,
     output_jsonl: Path,
     artifacts_dir: Path,
+    work_dir: Path,
     base_url: str,
     api_key: str,
     env_path: Path,
@@ -463,24 +736,31 @@ def _run_split_stage(
         )
 
     classification_map = _load_row_map(classification_path)
-    split_processed_ids = _load_processed_split_ids(split_decision_log_path) if args.resume else set()
+    split_processed_ids = _load_processed_split_ids(split_results_path) if args.resume else set()
     classified_ok_map = {k: v for k, v in classification_map.items() if v.get("status") == CLASSIFIED_OK}
     composite_ids = {k for k, v in classified_ok_map.items() if _is_split_candidate(v)}
-    todo_rows = [row for row in manifest_rows if row["sample_id"] in composite_ids and row["sample_id"] not in split_processed_ids]
+    todo_rows = [
+        row
+        for row in manifest_rows
+        if row["sample_id"] in composite_ids and row["sample_id"] not in split_processed_ids
+    ]
     if args.limit and args.limit > 0:
         todo_rows = todo_rows[: args.limit]
 
     if getattr(args, "progress", False):
         print(
-            f"[split] manifest_rows={len(manifest_rows)} classified_ok={len(classified_ok_map)} "
-            f"composite={len(composite_ids)} processed={len(split_processed_ids)} todo={len(todo_rows)}"
+            f"[split] backend={args.split_backend} manifest_rows={len(manifest_rows)} "
+            f"classified_ok={len(classified_ok_map)} composite={len(composite_ids)} "
+            f"processed={len(split_processed_ids)} todo={len(todo_rows)}"
         )
 
     summary = {
         "mode": "split-only",
+        "split_backend": str(args.split_backend).strip(),
+        "stage2_model": _selected_stage2_model(args),
         "env_file": str(env_path),
         "classification_jsonl": str(classification_path),
-        "split_decision_log_path": str(split_decision_log_path),
+        "split_results_jsonl": str(split_results_path),
         "output_jsonl": str(output_jsonl),
         "total_manifest_rows": len(manifest_rows),
         "classified_ok_rows": len(classified_ok_map),
@@ -494,58 +774,52 @@ def _run_split_stage(
         "unclassified_rows": len(manifest_rows) - len(classified_ok_map),
     }
 
-    def _worker(row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        client = _make_client(args, base_url=base_url, api_key=api_key)
-        return _split_one(
-            row,
-            classification_row=classified_ok_map[row["sample_id"]],
-            client=client,
-            stage1_model=args.stage1_model or args.model,
-            stage2_model=args.stage2_model or args.model,
-            api_image_max_edge=int(args.api_image_max_edge),
-            api_image_jpeg_quality=int(args.api_image_jpeg_quality),
-            artifacts_dir=artifacts_dir,
-        )
-
     if todo_rows:
         output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.parallelism))) as executor:
-        future_map = {executor.submit(_worker, row): row for row in todo_rows}
+        future_map = {
+            executor.submit(
+                _run_split_backend,
+                row,
+                classification_row=classified_ok_map[row["sample_id"]],
+                args=args,
+                artifacts_dir=artifacts_dir,
+                work_dir=work_dir,
+                base_url=base_url,
+                api_key=api_key,
+            ): row
+            for row in todo_rows
+        }
         for future in concurrent.futures.as_completed(future_map):
             row = future_map[future]
             try:
                 decision, split_rows = future.result()
             except Exception as exc:  # noqa: BLE001
-                decision = {
-                    "sample_id": row["sample_id"],
-                    "image_path": row["image_path"],
-                    "status": "error",
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "traceback": traceback.format_exc(limit=8),
-                    "stage1_model": args.stage1_model or args.model,
-                    "stage2_model": args.stage2_model or args.model,
-                }
-                if isinstance(exc, ModelResponseParseError):
-                    decision.update(_build_response_meta(exc.stage, exc.response))
+                decision = _build_split_decision(
+                    sample_id=str(row["sample_id"]),
+                    image_path=Path(row["image_path"]).expanduser().resolve(),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
                 split_rows = []
 
-            append_jsonl(split_decision_log_path, [decision])
+            append_jsonl(split_results_path, [decision])
             if split_rows:
                 append_jsonl(output_jsonl, split_rows)
 
             summary["processed_sample_rows"] += 1
             summary["processed_split_rows"] += len(split_rows)
-            if decision["status"] == SPLIT_EMPTY:
-                summary["empty_split_rows"] += 1
-            elif decision["status"] == "error":
+            if "error_type" in decision:
                 summary["error_rows"] += 1
+            elif not split_rows:
+                summary["empty_split_rows"] += 1
 
             if getattr(args, "progress", False):
+                split_state = "error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done")
                 print(
                     f"[split {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
-                    f"{decision['status']} image={os.path.basename(str(row['image_path']))} "
+                    f"{split_state} image={os.path.basename(str(row['image_path']))} "
                     f"splits={len(split_rows)}"
                 )
 
@@ -557,29 +831,42 @@ def _run_full_stage(
     args: Any,
     manifest_rows: List[Dict[str, Any]],
     classification_path: Path,
-    split_decision_log_path: Path,
+    split_results_path: Path,
     output_jsonl: Path,
     artifacts_dir: Path,
+    work_dir: Path,
     base_url: str,
     api_key: str,
     env_path: Path,
 ) -> Dict[str, Any]:
     classification_map = _load_row_map(classification_path) if classification_path.exists() else {}
-    split_processed_ids = _load_processed_split_ids(split_decision_log_path) if args.resume else set()
-    todo_rows = [row for row in manifest_rows if row["sample_id"] not in split_processed_ids]
+    split_processed_ids = _load_processed_split_ids(split_results_path) if args.resume else set()
+    todo_rows: List[Dict[str, Any]] = []
+    for row in manifest_rows:
+        existing = classification_map.get(row["sample_id"])
+        if existing is None or existing.get("status") != CLASSIFIED_OK:
+            todo_rows.append(row)
+            continue
+        if _is_split_candidate(existing) and row["sample_id"] not in split_processed_ids:
+            todo_rows.append(row)
     if args.limit and args.limit > 0:
         todo_rows = todo_rows[: args.limit]
+
     if getattr(args, "progress", False):
         print(
-            f"[full] manifest_rows={len(manifest_rows)} classification_cache={len(classification_map)} "
-            f"processed={len(split_processed_ids)} todo={len(todo_rows)}"
+            f"[full] backend={args.split_backend} manifest_rows={len(manifest_rows)} "
+            f"classification_cache={len(classification_map)} processed={len(split_processed_ids)} "
+            f"todo={len(todo_rows)}"
         )
 
     summary = {
         "mode": "full",
+        "split_backend": str(args.split_backend).strip(),
+        "stage1_model": str(args.stage1_model).strip(),
+        "stage2_model": _selected_stage2_model(args),
         "env_file": str(env_path),
         "classification_jsonl": str(classification_path),
-        "split_decision_log_path": str(split_decision_log_path),
+        "split_results_jsonl": str(split_results_path),
         "output_jsonl": str(output_jsonl),
         "total_manifest_rows": len(manifest_rows),
         "to_process_rows": len(todo_rows),
@@ -592,36 +879,35 @@ def _run_full_stage(
         "error_rows": 0,
     }
 
-    def _worker(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
-        client = _make_client(args, base_url=base_url, api_key=api_key)
+    def _worker(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         existing = classification_map.get(row["sample_id"])
         if existing is not None and existing.get("status") == CLASSIFIED_OK:
             classification_row = existing
             new_classification_row = None
         else:
+            client = _make_client(args, base_url=base_url, api_key=api_key)
             classification_row = _classify_one(
                 row,
                 client=client,
-                stage1_model=args.stage1_model or args.model,
+                stage1_model=str(args.stage1_model).strip(),
                 api_image_max_edge=int(args.api_image_max_edge),
                 api_image_jpeg_quality=int(args.api_image_jpeg_quality),
             )
             new_classification_row = classification_row
 
         if not _is_split_candidate(classification_row):
-            return new_classification_row, classification_row, []
+            return new_classification_row, None, []
 
-        split_decision, split_rows = _split_one(
+        decision, split_rows = _run_split_backend(
             row,
             classification_row=classification_row,
-            client=client,
-            stage1_model=args.stage1_model or args.model,
-            stage2_model=args.stage2_model or args.model,
-            api_image_max_edge=int(args.api_image_max_edge),
-            api_image_jpeg_quality=int(args.api_image_jpeg_quality),
+            args=args,
             artifacts_dir=artifacts_dir,
+            work_dir=work_dir,
+            base_url=base_url,
+            api_key=api_key,
         )
-        return new_classification_row, split_decision, split_rows
+        return new_classification_row, decision, split_rows
 
     if todo_rows:
         output_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -636,15 +922,12 @@ def _run_full_stage(
                 new_classification_row = {
                     "sample_id": row["sample_id"],
                     "image_path": row["image_path"],
-                    "status": "error",
+                    "status": SPLIT_ERROR,
                     "error_type": type(exc).__name__,
                     "error_message": str(exc),
                     "traceback": traceback.format_exc(limit=8),
-                    "stage1_model": args.stage1_model or args.model,
                 }
-                if isinstance(exc, ModelResponseParseError):
-                    new_classification_row.update(_build_response_meta(exc.stage, exc.response))
-                decision = new_classification_row
+                decision = None
                 split_rows = []
 
             if new_classification_row is not None:
@@ -655,35 +938,48 @@ def _run_full_stage(
             else:
                 summary["classification_reused_rows"] += 1
 
-            if decision.get("status") in {SPLIT_DONE, SPLIT_EMPTY, "error"}:
-                append_jsonl(split_decision_log_path, [decision])
-                if split_rows:
-                    append_jsonl(output_jsonl, split_rows)
-
             summary["processed_sample_rows"] += 1
-            status = str(decision.get("status", "")).strip()
-            if status == CLASSIFIED_OK and not bool(decision.get("is_composite", False)):
-                summary["skipped_single_rows"] += 1
-            elif status == SPLIT_EMPTY:
-                summary["empty_split_rows"] += 1
-            elif status == "error":
+
+            if new_classification_row is not None and new_classification_row.get("status") != CLASSIFIED_OK:
                 summary["error_rows"] += 1
+                if getattr(args, "progress", False):
+                    print(
+                        f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
+                        f"{new_classification_row['status']} image={os.path.basename(str(row['image_path']))} splits=0"
+                    )
+                continue
+
+            if decision is None:
+                summary["skipped_single_rows"] += 1
+                if getattr(args, "progress", False):
+                    print(
+                        f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
+                        f"{CLASSIFIED_OK} image={os.path.basename(str(row['image_path']))} is_composite=False"
+                    )
+                continue
+
+            append_jsonl(split_results_path, [decision])
+            if split_rows:
+                append_jsonl(output_jsonl, split_rows)
+
+            if "error_type" in decision:
+                summary["error_rows"] += 1
+            elif not split_rows:
+                summary["empty_split_rows"] += 1
             summary["processed_split_rows"] += len(split_rows)
 
             if getattr(args, "progress", False):
-                suffix = f"splits={len(split_rows)}"
-                if status == CLASSIFIED_OK:
-                    suffix = f"is_composite={bool(decision.get('is_composite', False))}"
+                split_state = "error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done")
                 print(
                     f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
-                    f"{status} image={os.path.basename(str(row['image_path']))} {suffix}"
+                    f"{split_state} image={os.path.basename(str(row['image_path']))} splits={len(split_rows)}"
                 )
 
     return summary
 
 
 def run_pipeline(args: Any) -> Dict[str, Any]:
-    base_url, api_key, env_path = get_api_config(Path(args.env_file).expanduser().resolve())
+    base_url, api_key, env_path = get_provider_config(Path(args.env_file).expanduser().resolve())
     work_dir = Path(args.work_dir).expanduser().resolve()
     artifacts_dir = work_dir / "artifacts"
     runs_dir = work_dir / "runs"
@@ -692,7 +988,7 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
 
     manifest_path = artifacts_dir / "source_manifest.jsonl"
     classification_path = Path(args.classification_jsonl).expanduser().resolve()
-    split_decision_log_path = artifacts_dir / "decision_log.jsonl"
+    split_results_path = Path(args.split_results_jsonl).expanduser().resolve()
     output_jsonl = Path(args.output_jsonl).expanduser().resolve()
     mode = str(args.mode).strip().lower()
 
@@ -700,8 +996,8 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
         if mode in {"classify-only", "full"} and classification_path.exists():
             classification_path.unlink()
         if mode in {"split-only", "full"}:
-            if split_decision_log_path.exists():
-                split_decision_log_path.unlink()
+            if split_results_path.exists():
+                split_results_path.unlink()
             if output_jsonl.exists():
                 output_jsonl.unlink()
 
@@ -722,9 +1018,10 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
             args=args,
             manifest_rows=manifest_rows,
             classification_path=classification_path,
-            split_decision_log_path=split_decision_log_path,
+            split_results_path=split_results_path,
             output_jsonl=output_jsonl,
             artifacts_dir=artifacts_dir,
+            work_dir=work_dir,
             base_url=base_url,
             api_key=api_key,
             env_path=env_path,
@@ -733,9 +1030,10 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
         args=args,
         manifest_rows=manifest_rows,
         classification_path=classification_path,
-        split_decision_log_path=split_decision_log_path,
+        split_results_path=split_results_path,
         output_jsonl=output_jsonl,
         artifacts_dir=artifacts_dir,
+        work_dir=work_dir,
         base_url=base_url,
         api_key=api_key,
         env_path=env_path,
