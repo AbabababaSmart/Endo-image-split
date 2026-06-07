@@ -4,5 +4,5 @@ runs/
 review_composite_classification.ipynb
 review_composite_image_descriptions.ipynb
 .env
-test_data/2b4802_subfigures
+test_data/
 draft/
