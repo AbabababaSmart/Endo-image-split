@@ -539,13 +539,7 @@ def _split_one_codex(
             splits_dir=splits_dir.resolve(),
         )
 
-        if len(source_subfigures) < 2:
-            expected_count = int(classification_row.get("estimated_subfigure_count", 0) or 0)
-            if expected_count >= 2:
-                raise ValueError(
-                    f"Codex returned fewer than 2 saved subfigures for composite candidate "
-                    f"(estimated_subfigure_count={expected_count})."
-                )
+        if not source_subfigures:
             return _build_split_decision(
                 sample_id=sample_id,
                 image_path=image_path,
@@ -610,7 +604,10 @@ def _run_classification_stage(
     if args.limit and args.limit > 0:
         todo_rows = todo_rows[: args.limit]
     if getattr(args, "progress", False):
-        print(f"[classify] manifest_rows={len(manifest_rows)} existing={len(existing_map)} todo={len(todo_rows)}")
+        print(
+            f"[classify] manifest_rows={len(manifest_rows)} existing={len(existing_map)} todo={len(todo_rows)}",
+            flush=True,
+        )
 
     summary = {
         "mode": "classify-only",
@@ -627,15 +624,27 @@ def _run_classification_stage(
         "error_rows": 0,
     }
 
+    def _progress(message: str) -> None:
+        if getattr(args, "progress", False):
+            print(message, flush=True)
+
     def _worker(row: Dict[str, Any]) -> Dict[str, Any]:
+        image_name = os.path.basename(str(row["image_path"]))
+        _progress(f"[classify pending] start image={image_name}")
         client = _make_client(args, base_url=base_url, api_key=api_key)
-        return _classify_one(
+        _progress(f"[classify pending] request_start image={image_name} model={str(args.stage1_model).strip()}")
+        result = _classify_one(
             row,
             client=client,
             stage1_model=str(args.stage1_model).strip(),
             api_image_max_edge=int(args.api_image_max_edge),
             api_image_jpeg_quality=int(args.api_image_jpeg_quality),
         )
+        _progress(
+            f"[classify pending] request_done image={image_name} "
+            f"is_composite={bool(result.get('is_composite', False))}"
+        )
+        return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.parallelism))) as executor:
         future_map = {executor.submit(_worker, row): row for row in todo_rows}
@@ -664,12 +673,11 @@ def _run_classification_stage(
             else:
                 summary["error_rows"] += 1
 
-            if getattr(args, "progress", False):
-                extra = f"is_composite={bool(result.get('is_composite', False))}" if result["status"] == CLASSIFIED_OK else "is_composite=?"
-                print(
-                    f"[classify {summary['processed_rows']}/{summary['to_process_rows']}] "
-                    f"{result['status']} image={os.path.basename(str(row['image_path']))} {extra}"
-                )
+            extra = f"is_composite={bool(result.get('is_composite', False))}" if result["status"] == CLASSIFIED_OK else "is_composite=?"
+            _progress(
+                f"[classify {summary['processed_rows']}/{summary['to_process_rows']}] "
+                f"{result['status']} image={os.path.basename(str(row['image_path']))} {extra}"
+            )
 
     final_map = _load_row_map(classification_path)
     classified_ok = [row for row in final_map.values() if row.get("status") == CLASSIFIED_OK]
@@ -879,34 +887,72 @@ def _run_full_stage(
         "error_rows": 0,
     }
 
+    def _progress(message: str) -> None:
+        if getattr(args, "progress", False):
+            print(message, flush=True)
+
     def _worker(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        image_name = os.path.basename(str(row["image_path"]))
+        _progress(f"[full pending] start image={image_name}")
         existing = classification_map.get(row["sample_id"])
         if existing is not None and existing.get("status") == CLASSIFIED_OK:
             classification_row = existing
             new_classification_row = None
+            _progress(f"[full pending] reuse_classification image={image_name}")
         else:
-            client = _make_client(args, base_url=base_url, api_key=api_key)
-            classification_row = _classify_one(
-                row,
-                client=client,
-                stage1_model=str(args.stage1_model).strip(),
-                api_image_max_edge=int(args.api_image_max_edge),
-                api_image_jpeg_quality=int(args.api_image_jpeg_quality),
-            )
+            try:
+                _progress(f"[full pending] classify_start image={image_name}")
+                client = _make_client(args, base_url=base_url, api_key=api_key)
+                classification_row = _classify_one(
+                    row,
+                    client=client,
+                    stage1_model=str(args.stage1_model).strip(),
+                    api_image_max_edge=int(args.api_image_max_edge),
+                    api_image_jpeg_quality=int(args.api_image_jpeg_quality),
+                )
+                _progress(
+                    f"[full pending] classify_done image={image_name} "
+                    f"is_composite={bool(classification_row.get('is_composite', False))}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    {
+                        "sample_id": row["sample_id"],
+                        "image_path": row["image_path"],
+                        "status": SPLIT_ERROR,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "traceback": traceback.format_exc(limit=8),
+                    },
+                    None,
+                    [],
+                )
             new_classification_row = classification_row
 
         if not _is_split_candidate(classification_row):
             return new_classification_row, None, []
 
-        decision, split_rows = _run_split_backend(
-            row,
-            classification_row=classification_row,
-            args=args,
-            artifacts_dir=artifacts_dir,
-            work_dir=work_dir,
-            base_url=base_url,
-            api_key=api_key,
-        )
+        try:
+            _progress(f"[full pending] split_start image={image_name} backend={args.split_backend}")
+            decision, split_rows = _run_split_backend(
+                row,
+                classification_row=classification_row,
+                args=args,
+                artifacts_dir=artifacts_dir,
+                work_dir=work_dir,
+                base_url=base_url,
+                api_key=api_key,
+            )
+            _progress(f"[full pending] split_done image={image_name} splits={len(split_rows)}")
+        except Exception as exc:  # noqa: BLE001
+            _progress(f"[full pending] split_error image={image_name} error={type(exc).__name__}: {exc}")
+            decision = _build_split_decision(
+                sample_id=str(row["sample_id"]),
+                image_path=Path(row["image_path"]).expanduser().resolve(),
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            split_rows = []
         return new_classification_row, decision, split_rows
 
     if todo_rows:
@@ -919,15 +965,13 @@ def _run_full_stage(
             try:
                 new_classification_row, decision, split_rows = future.result()
             except Exception as exc:  # noqa: BLE001
-                new_classification_row = {
-                    "sample_id": row["sample_id"],
-                    "image_path": row["image_path"],
-                    "status": SPLIT_ERROR,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "traceback": traceback.format_exc(limit=8),
-                }
-                decision = None
+                new_classification_row = None
+                decision = _build_split_decision(
+                    sample_id=str(row["sample_id"]),
+                    image_path=Path(row["image_path"]).expanduser().resolve(),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
                 split_rows = []
 
             if new_classification_row is not None:
@@ -942,20 +986,18 @@ def _run_full_stage(
 
             if new_classification_row is not None and new_classification_row.get("status") != CLASSIFIED_OK:
                 summary["error_rows"] += 1
-                if getattr(args, "progress", False):
-                    print(
-                        f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
-                        f"{new_classification_row['status']} image={os.path.basename(str(row['image_path']))} splits=0"
-                    )
+                _progress(
+                    f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
+                    f"{new_classification_row['status']} image={os.path.basename(str(row['image_path']))} splits=0"
+                )
                 continue
 
             if decision is None:
                 summary["skipped_single_rows"] += 1
-                if getattr(args, "progress", False):
-                    print(
-                        f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
-                        f"{CLASSIFIED_OK} image={os.path.basename(str(row['image_path']))} is_composite=False"
-                    )
+                _progress(
+                    f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
+                    f"{CLASSIFIED_OK} image={os.path.basename(str(row['image_path']))} is_composite=False"
+                )
                 continue
 
             append_jsonl(split_results_path, [decision])
@@ -968,12 +1010,11 @@ def _run_full_stage(
                 summary["empty_split_rows"] += 1
             summary["processed_split_rows"] += len(split_rows)
 
-            if getattr(args, "progress", False):
-                split_state = "error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done")
-                print(
-                    f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
-                    f"{split_state} image={os.path.basename(str(row['image_path']))} splits={len(split_rows)}"
-                )
+            split_state = "error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done")
+            _progress(
+                f"[full {summary['processed_sample_rows']}/{summary['to_process_rows']}] "
+                f"{split_state} image={os.path.basename(str(row['image_path']))} splits={len(split_rows)}"
+            )
 
     return summary
 
