@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import shutil
 import tempfile
@@ -105,6 +106,36 @@ def _build_timing_row(
     if error_message:
         timing_row["error_message"] = error_message
     return timing_row
+
+
+def _append_timing_log(path: Path, timing_row: Dict[str, Any]) -> None:
+    detail_rows: List[Dict[str, Any]] = []
+    if path.exists():
+        for row in read_jsonl(path):
+            if row.get("record_type") == "summary":
+                continue
+            detail_rows.append(row)
+    detail_rows.append(timing_row)
+
+    elapsed_values = [float(row.get("elapsed_s", 0.0) or 0.0) for row in detail_rows]
+    total_elapsed_s = sum(elapsed_values)
+    summary: Dict[str, Any] = {
+        "record_type": "summary",
+        "stage": str(timing_row.get("stage", "") or ""),
+        "sample_count": len(detail_rows),
+        "avg_elapsed_s": round(total_elapsed_s / len(detail_rows), 6) if detail_rows else 0.0,
+        "total_elapsed_s": round(total_elapsed_s, 6),
+    }
+    if timing_row.get("model"):
+        summary["latest_model"] = timing_row["model"]
+    if timing_row.get("split_backend"):
+        summary["latest_split_backend"] = timing_row["split_backend"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        for row in detail_rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def _normalize_manifest_rows(rows: List[Dict[str, Any]], *, work_dir: Path) -> List[Dict[str, Any]]:
@@ -716,19 +747,17 @@ def _run_classification_stage(
                 }
 
             append_jsonl(classification_path, [result])
-            append_jsonl(
+            _append_timing_log(
                 classify_timing_log_path,
-                [
-                    _build_timing_row(
-                        stage="classify",
-                        row=row,
-                        elapsed_s=elapsed_s,
-                        status=str(result.get("status", "") or ""),
-                        model=str(args.stage1_model).strip(),
-                        error_type=str(result.get("error_type", "") or ""),
-                        error_message=str(result.get("error_message", "") or ""),
-                    )
-                ],
+                _build_timing_row(
+                    stage="classify",
+                    row=row,
+                    elapsed_s=elapsed_s,
+                    status=str(result.get("status", "") or ""),
+                    model=str(args.stage1_model).strip(),
+                    error_type=str(result.get("error_type", "") or ""),
+                    error_message=str(result.get("error_message", "") or ""),
+                ),
             )
             summary["processed_rows"] += 1
             if result["status"] == CLASSIFIED_OK:
@@ -894,21 +923,19 @@ def _run_split_stage(
             append_jsonl(split_results_path, [decision])
             if split_rows:
                 append_jsonl(output_jsonl, split_rows)
-            append_jsonl(
+            _append_timing_log(
                 split_timing_log_path,
-                [
-                    _build_timing_row(
-                        stage="split",
-                        row=row,
-                        elapsed_s=elapsed_s,
-                        status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
-                        model=_selected_stage2_model(args),
-                        split_backend=str(args.split_backend).strip(),
-                        split_count=len(split_rows),
-                        error_type=str(decision.get("error_type", "") or ""),
-                        error_message=str(decision.get("error_message", "") or ""),
-                    )
-                ],
+                _build_timing_row(
+                    stage="split",
+                    row=row,
+                    elapsed_s=elapsed_s,
+                    status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
+                    model=_selected_stage2_model(args),
+                    split_backend=str(args.split_backend).strip(),
+                    split_count=len(split_rows),
+                    error_type=str(decision.get("error_type", "") or ""),
+                    error_message=str(decision.get("error_message", "") or ""),
+                ),
             )
 
             summary["processed_sample_rows"] += 1
@@ -1089,19 +1116,17 @@ def _run_full_stage(
             if new_classification_row is not None:
                 append_jsonl(classification_path, [new_classification_row])
                 if classify_elapsed_s is not None:
-                    append_jsonl(
+                    _append_timing_log(
                         classify_timing_log_path,
-                        [
-                            _build_timing_row(
-                                stage="classify",
-                                row=row,
-                                elapsed_s=classify_elapsed_s,
-                                status=str(new_classification_row.get("status", "") or ""),
-                                model=str(args.stage1_model).strip(),
-                                error_type=str(new_classification_row.get("error_type", "") or ""),
-                                error_message=str(new_classification_row.get("error_message", "") or ""),
-                            )
-                        ],
+                        _build_timing_row(
+                            stage="classify",
+                            row=row,
+                            elapsed_s=classify_elapsed_s,
+                            status=str(new_classification_row.get("status", "") or ""),
+                            model=str(args.stage1_model).strip(),
+                            error_type=str(new_classification_row.get("error_type", "") or ""),
+                            error_message=str(new_classification_row.get("error_message", "") or ""),
+                        ),
                     )
                 if new_classification_row.get("status") == CLASSIFIED_OK:
                     classification_map[new_classification_row["sample_id"]] = new_classification_row
@@ -1131,21 +1156,19 @@ def _run_full_stage(
             if split_rows:
                 append_jsonl(output_jsonl, split_rows)
             if split_elapsed_s is not None:
-                append_jsonl(
+                _append_timing_log(
                     split_timing_log_path,
-                    [
-                        _build_timing_row(
-                            stage="split",
-                            row=row,
-                            elapsed_s=split_elapsed_s,
-                            status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
-                            model=_selected_stage2_model(args),
-                            split_backend=str(args.split_backend).strip(),
-                            split_count=len(split_rows),
-                            error_type=str(decision.get("error_type", "") or ""),
-                            error_message=str(decision.get("error_message", "") or ""),
-                        )
-                    ],
+                    _build_timing_row(
+                        stage="split",
+                        row=row,
+                        elapsed_s=split_elapsed_s,
+                        status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
+                        model=_selected_stage2_model(args),
+                        split_backend=str(args.split_backend).strip(),
+                        split_count=len(split_rows),
+                        error_type=str(decision.get("error_type", "") or ""),
+                        error_message=str(decision.get("error_message", "") or ""),
+                    ),
                 )
 
             if "error_type" in decision:

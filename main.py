@@ -86,7 +86,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-image-max-edge", type=int, default=1536)
     parser.add_argument("--api-image-jpeg-quality", type=int, default=90)
     parser.add_argument("--parallelism", type=int, default=1)
-    parser.add_argument("--timeout-s", type=int, default=180)
+    parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
