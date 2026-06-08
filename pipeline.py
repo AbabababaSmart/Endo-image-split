@@ -4,6 +4,7 @@ import concurrent.futures
 import os
 import shutil
 import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +46,13 @@ class ModelResponseParseError(ValueError):
         self.cause = cause
 
 
+class TimedStageError(RuntimeError):
+    def __init__(self, *, elapsed_s: float, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.elapsed_s = elapsed_s
+        self.cause = cause
+
+
 def _load_row_map(path: Path) -> Dict[str, Dict[str, Any]]:
     rows: Dict[str, Dict[str, Any]] = {}
     if not path.exists():
@@ -65,6 +73,38 @@ def _load_processed_split_ids(split_results_path: Path) -> set[str]:
         if sample_id and "error_type" not in row:
             processed.add(sample_id)
     return processed
+
+
+def _build_timing_row(
+    *,
+    stage: str,
+    row: Dict[str, Any],
+    elapsed_s: float,
+    status: str,
+    model: str = "",
+    split_backend: str = "",
+    split_count: Optional[int] = None,
+    error_type: str = "",
+    error_message: str = "",
+) -> Dict[str, Any]:
+    timing_row: Dict[str, Any] = {
+        "stage": stage,
+        "sample_id": str(row.get("sample_id", "") or ""),
+        "image_path": str(row.get("image_path", "") or ""),
+        "elapsed_s": round(float(elapsed_s), 6),
+        "status": status,
+    }
+    if model:
+        timing_row["model"] = model
+    if split_backend:
+        timing_row["split_backend"] = split_backend
+    if split_count is not None:
+        timing_row["split_count"] = int(split_count)
+    if error_type:
+        timing_row["error_type"] = error_type
+    if error_message:
+        timing_row["error_message"] = error_message
+    return timing_row
 
 
 def _normalize_manifest_rows(rows: List[Dict[str, Any]], *, work_dir: Path) -> List[Dict[str, Any]]:
@@ -594,6 +634,7 @@ def _run_classification_stage(
     args: Any,
     manifest_rows: List[Dict[str, Any]],
     classification_path: Path,
+    classify_timing_log_path: Path,
     manifest_path: Path,
     base_url: str,
     api_key: str,
@@ -615,6 +656,7 @@ def _run_classification_stage(
         "env_file": str(env_path),
         "manifest_path": str(manifest_path),
         "classification_jsonl": str(classification_path),
+        "classify_timing_log": str(classify_timing_log_path),
         "total_manifest_rows": len(manifest_rows),
         "to_process_rows": len(todo_rows),
         "processed_rows": 0,
@@ -628,41 +670,66 @@ def _run_classification_stage(
         if getattr(args, "progress", False):
             print(message, flush=True)
 
-    def _worker(row: Dict[str, Any]) -> Dict[str, Any]:
+    def _worker(row: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+        started_at = time.perf_counter()
         image_name = os.path.basename(str(row["image_path"]))
-        _progress(f"[classify pending] start image={image_name}")
-        client = _make_client(args, base_url=base_url, api_key=api_key)
-        _progress(f"[classify pending] request_start image={image_name} model={str(args.stage1_model).strip()}")
-        result = _classify_one(
-            row,
-            client=client,
-            stage1_model=str(args.stage1_model).strip(),
-            api_image_max_edge=int(args.api_image_max_edge),
-            api_image_jpeg_quality=int(args.api_image_jpeg_quality),
-        )
-        _progress(
-            f"[classify pending] request_done image={image_name} "
-            f"is_composite={bool(result.get('is_composite', False))}"
-        )
-        return result
+        try:
+            _progress(f"[classify pending] start image={image_name}")
+            client = _make_client(args, base_url=base_url, api_key=api_key)
+            _progress(f"[classify pending] request_start image={image_name} model={str(args.stage1_model).strip()}")
+            result = _classify_one(
+                row,
+                client=client,
+                stage1_model=str(args.stage1_model).strip(),
+                api_image_max_edge=int(args.api_image_max_edge),
+                api_image_jpeg_quality=int(args.api_image_jpeg_quality),
+            )
+            _progress(
+                f"[classify pending] request_done image={image_name} "
+                f"is_composite={bool(result.get('is_composite', False))}"
+            )
+            return result, time.perf_counter() - started_at
+        except Exception as exc:
+            elapsed_s = time.perf_counter() - started_at
+            raise TimedStageError(elapsed_s=elapsed_s, cause=exc) from exc
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.parallelism))) as executor:
         future_map = {executor.submit(_worker, row): row for row in todo_rows}
         for future in concurrent.futures.as_completed(future_map):
             row = future_map[future]
+            elapsed_s = 0.0
             try:
-                result = future.result()
+                result, elapsed_s = future.result()
             except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, TimedStageError):
+                    elapsed_s = exc.elapsed_s
+                    cause = exc.cause
+                else:
+                    cause = exc
                 result = {
                     "sample_id": row["sample_id"],
                     "image_path": row["image_path"],
                     "status": SPLIT_ERROR,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
+                    "error_type": type(cause).__name__,
+                    "error_message": str(cause),
                     "traceback": traceback.format_exc(limit=8),
                 }
 
             append_jsonl(classification_path, [result])
+            append_jsonl(
+                classify_timing_log_path,
+                [
+                    _build_timing_row(
+                        stage="classify",
+                        row=row,
+                        elapsed_s=elapsed_s,
+                        status=str(result.get("status", "") or ""),
+                        model=str(args.stage1_model).strip(),
+                        error_type=str(result.get("error_type", "") or ""),
+                        error_message=str(result.get("error_message", "") or ""),
+                    )
+                ],
+            )
             summary["processed_rows"] += 1
             if result["status"] == CLASSIFIED_OK:
                 summary["classified_ok_rows"] += 1
@@ -731,6 +798,7 @@ def _run_split_stage(
     classification_path: Path,
     split_results_path: Path,
     output_jsonl: Path,
+    split_timing_log_path: Path,
     artifacts_dir: Path,
     work_dir: Path,
     base_url: str,
@@ -770,6 +838,7 @@ def _run_split_stage(
         "classification_jsonl": str(classification_path),
         "split_results_jsonl": str(split_results_path),
         "output_jsonl": str(output_jsonl),
+        "split_timing_log": str(split_timing_log_path),
         "total_manifest_rows": len(manifest_rows),
         "classified_ok_rows": len(classified_ok_map),
         "classified_composite_rows": len(composite_ids),
@@ -785,10 +854,10 @@ def _run_split_stage(
     if todo_rows:
         output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.parallelism))) as executor:
-        future_map = {
-            executor.submit(
-                _run_split_backend,
+    def _worker(row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], float]:
+        started_at = time.perf_counter()
+        try:
+            decision, split_rows = _run_split_backend(
                 row,
                 classification_row=classified_ok_map[row["sample_id"]],
                 args=args,
@@ -796,25 +865,51 @@ def _run_split_stage(
                 work_dir=work_dir,
                 base_url=base_url,
                 api_key=api_key,
-            ): row
-            for row in todo_rows
-        }
+            )
+            return decision, split_rows, time.perf_counter() - started_at
+        except Exception as exc:
+            raise TimedStageError(elapsed_s=time.perf_counter() - started_at, cause=exc) from exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.parallelism))) as executor:
+        future_map = {executor.submit(_worker, row): row for row in todo_rows}
         for future in concurrent.futures.as_completed(future_map):
             row = future_map[future]
+            elapsed_s = 0.0
             try:
-                decision, split_rows = future.result()
+                decision, split_rows, elapsed_s = future.result()
             except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, TimedStageError):
+                    elapsed_s = exc.elapsed_s
+                    cause = exc.cause
+                else:
+                    cause = exc
                 decision = _build_split_decision(
                     sample_id=str(row["sample_id"]),
                     image_path=Path(row["image_path"]).expanduser().resolve(),
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
+                    error_type=type(cause).__name__,
+                    error_message=str(cause),
                 )
                 split_rows = []
 
             append_jsonl(split_results_path, [decision])
             if split_rows:
                 append_jsonl(output_jsonl, split_rows)
+            append_jsonl(
+                split_timing_log_path,
+                [
+                    _build_timing_row(
+                        stage="split",
+                        row=row,
+                        elapsed_s=elapsed_s,
+                        status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
+                        model=_selected_stage2_model(args),
+                        split_backend=str(args.split_backend).strip(),
+                        split_count=len(split_rows),
+                        error_type=str(decision.get("error_type", "") or ""),
+                        error_message=str(decision.get("error_message", "") or ""),
+                    )
+                ],
+            )
 
             summary["processed_sample_rows"] += 1
             summary["processed_split_rows"] += len(split_rows)
@@ -841,6 +936,8 @@ def _run_full_stage(
     classification_path: Path,
     split_results_path: Path,
     output_jsonl: Path,
+    classify_timing_log_path: Path,
+    split_timing_log_path: Path,
     artifacts_dir: Path,
     work_dir: Path,
     base_url: str,
@@ -876,6 +973,8 @@ def _run_full_stage(
         "classification_jsonl": str(classification_path),
         "split_results_jsonl": str(split_results_path),
         "output_jsonl": str(output_jsonl),
+        "classify_timing_log": str(classify_timing_log_path),
+        "split_timing_log": str(split_timing_log_path),
         "total_manifest_rows": len(manifest_rows),
         "to_process_rows": len(todo_rows),
         "classification_reused_rows": 0,
@@ -891,15 +990,19 @@ def _run_full_stage(
         if getattr(args, "progress", False):
             print(message, flush=True)
 
-    def _worker(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _worker(
+        row: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[float], Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[float]]:
         image_name = os.path.basename(str(row["image_path"]))
         _progress(f"[full pending] start image={image_name}")
         existing = classification_map.get(row["sample_id"])
         if existing is not None and existing.get("status") == CLASSIFIED_OK:
             classification_row = existing
             new_classification_row = None
+            classify_elapsed_s = None
             _progress(f"[full pending] reuse_classification image={image_name}")
         else:
+            classify_started_at = time.perf_counter()
             try:
                 _progress(f"[full pending] classify_start image={image_name}")
                 client = _make_client(args, base_url=base_url, api_key=api_key)
@@ -914,7 +1017,9 @@ def _run_full_stage(
                     f"[full pending] classify_done image={image_name} "
                     f"is_composite={bool(classification_row.get('is_composite', False))}"
                 )
+                classify_elapsed_s = time.perf_counter() - classify_started_at
             except Exception as exc:  # noqa: BLE001
+                classify_elapsed_s = time.perf_counter() - classify_started_at
                 return (
                     {
                         "sample_id": row["sample_id"],
@@ -924,14 +1029,17 @@ def _run_full_stage(
                         "error_message": str(exc),
                         "traceback": traceback.format_exc(limit=8),
                     },
+                    classify_elapsed_s,
                     None,
                     [],
+                    None,
                 )
             new_classification_row = classification_row
 
         if not _is_split_candidate(classification_row):
-            return new_classification_row, None, []
+            return new_classification_row, classify_elapsed_s, None, [], None
 
+        split_started_at = time.perf_counter()
         try:
             _progress(f"[full pending] split_start image={image_name} backend={args.split_backend}")
             decision, split_rows = _run_split_backend(
@@ -944,7 +1052,9 @@ def _run_full_stage(
                 api_key=api_key,
             )
             _progress(f"[full pending] split_done image={image_name} splits={len(split_rows)}")
+            split_elapsed_s = time.perf_counter() - split_started_at
         except Exception as exc:  # noqa: BLE001
+            split_elapsed_s = time.perf_counter() - split_started_at
             _progress(f"[full pending] split_error image={image_name} error={type(exc).__name__}: {exc}")
             decision = _build_split_decision(
                 sample_id=str(row["sample_id"]),
@@ -953,7 +1063,7 @@ def _run_full_stage(
                 error_message=str(exc),
             )
             split_rows = []
-        return new_classification_row, decision, split_rows
+        return new_classification_row, classify_elapsed_s, decision, split_rows, split_elapsed_s
 
     if todo_rows:
         output_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -962,8 +1072,10 @@ def _run_full_stage(
         future_map = {executor.submit(_worker, row): row for row in todo_rows}
         for future in concurrent.futures.as_completed(future_map):
             row = future_map[future]
+            classify_elapsed_s = None
+            split_elapsed_s = None
             try:
-                new_classification_row, decision, split_rows = future.result()
+                new_classification_row, classify_elapsed_s, decision, split_rows, split_elapsed_s = future.result()
             except Exception as exc:  # noqa: BLE001
                 new_classification_row = None
                 decision = _build_split_decision(
@@ -976,6 +1088,21 @@ def _run_full_stage(
 
             if new_classification_row is not None:
                 append_jsonl(classification_path, [new_classification_row])
+                if classify_elapsed_s is not None:
+                    append_jsonl(
+                        classify_timing_log_path,
+                        [
+                            _build_timing_row(
+                                stage="classify",
+                                row=row,
+                                elapsed_s=classify_elapsed_s,
+                                status=str(new_classification_row.get("status", "") or ""),
+                                model=str(args.stage1_model).strip(),
+                                error_type=str(new_classification_row.get("error_type", "") or ""),
+                                error_message=str(new_classification_row.get("error_message", "") or ""),
+                            )
+                        ],
+                    )
                 if new_classification_row.get("status") == CLASSIFIED_OK:
                     classification_map[new_classification_row["sample_id"]] = new_classification_row
                 summary["classification_new_rows"] += 1
@@ -1003,6 +1130,23 @@ def _run_full_stage(
             append_jsonl(split_results_path, [decision])
             if split_rows:
                 append_jsonl(output_jsonl, split_rows)
+            if split_elapsed_s is not None:
+                append_jsonl(
+                    split_timing_log_path,
+                    [
+                        _build_timing_row(
+                            stage="split",
+                            row=row,
+                            elapsed_s=split_elapsed_s,
+                            status="error" if "error_type" in decision else ("split_empty" if not split_rows else "split_done"),
+                            model=_selected_stage2_model(args),
+                            split_backend=str(args.split_backend).strip(),
+                            split_count=len(split_rows),
+                            error_type=str(decision.get("error_type", "") or ""),
+                            error_message=str(decision.get("error_message", "") or ""),
+                        )
+                    ],
+                )
 
             if "error_type" in decision:
                 summary["error_rows"] += 1
@@ -1031,16 +1175,22 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
     classification_path = Path(args.classification_jsonl).expanduser().resolve()
     split_results_path = Path(args.split_results_jsonl).expanduser().resolve()
     output_jsonl = Path(args.output_jsonl).expanduser().resolve()
+    classify_timing_log_path = Path(args.classify_timing_log).expanduser().resolve()
+    split_timing_log_path = Path(args.split_timing_log).expanduser().resolve()
     mode = str(args.mode).strip().lower()
 
     if not args.resume:
         if mode in {"classify-only", "full"} and classification_path.exists():
             classification_path.unlink()
+        if mode in {"classify-only", "full"} and classify_timing_log_path.exists():
+            classify_timing_log_path.unlink()
         if mode in {"split-only", "full"}:
             if split_results_path.exists():
                 split_results_path.unlink()
             if output_jsonl.exists():
                 output_jsonl.unlink()
+            if split_timing_log_path.exists():
+                split_timing_log_path.unlink()
 
     manifest_rows = _ensure_manifest(args, manifest_path)
 
@@ -1049,6 +1199,7 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
             args=args,
             manifest_rows=manifest_rows,
             classification_path=classification_path,
+            classify_timing_log_path=classify_timing_log_path,
             manifest_path=manifest_path,
             base_url=base_url,
             api_key=api_key,
@@ -1061,6 +1212,7 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
             classification_path=classification_path,
             split_results_path=split_results_path,
             output_jsonl=output_jsonl,
+            split_timing_log_path=split_timing_log_path,
             artifacts_dir=artifacts_dir,
             work_dir=work_dir,
             base_url=base_url,
@@ -1073,6 +1225,8 @@ def run_pipeline(args: Any) -> Dict[str, Any]:
         classification_path=classification_path,
         split_results_path=split_results_path,
         output_jsonl=output_jsonl,
+        classify_timing_log_path=classify_timing_log_path,
+        split_timing_log_path=split_timing_log_path,
         artifacts_dir=artifacts_dir,
         work_dir=work_dir,
         base_url=base_url,

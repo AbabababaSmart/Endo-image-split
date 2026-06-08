@@ -44,6 +44,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-source-image split decisions for either vlm or codex backends.",
     )
     parser.add_argument(
+        "--classify-timing-log",
+        default=str(PROJECT_ROOT / "runs" / "classify_timing.log"),
+        help="JSONL timing log for newly processed stage 1 classification rows.",
+    )
+    parser.add_argument(
+        "--split-timing-log",
+        default=str(PROJECT_ROOT / "runs" / "split_timing.log"),
+        help="JSONL timing log for newly processed stage 2 split rows.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["full", "classify-only", "split-only"],
         default="full",
