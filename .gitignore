@@ -1,6 +1,7 @@
 __pycache__/
 artifacts/
-runs/
+runs/*
+!runs/subfigure_pairs.jsonl
 review_composite_classification.ipynb
 review_composite_image_descriptions.ipynb
 .env
